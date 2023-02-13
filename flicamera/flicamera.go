@@ -69,14 +69,14 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	C.FliSdk_detectGrabbers_V2(fliContext, text, textSize)
 	grabberStrings := strings.Split(C.GoString(text), ";")
 	if len(grabberStrings) == 0 {
-		return nil, fmt.Errorf("No grabbers found")
+		return nil, fmt.Errorf("flisdk: No grabbers found")
 	}
 
 	// Get list of cameras
 	C.FliSdk_detectCameras_V2(fliContext, text, textSize)
 	cameraStrings := strings.Split(C.GoString(text), ";")
 	if len(cameraStrings) == 0 {
-		return nil, fmt.Errorf("No cameras found")
+		return nil, fmt.Errorf("flisdk: No cameras found")
 	}
 
 	// Set the grabber to the configured model if found
@@ -88,17 +88,17 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	defer C.free(unsafe.Pointer(cameraName))
 
 	if ok = C.FliSdk_setGrabber_V2(fliContext, grabberName); !ok {
-		return nil, fmt.Errorf("Unable to set grabber: %s", grabberStrings[0])
+		return nil, fmt.Errorf("flisdk: Unable to set grabber: %s", grabberStrings[0])
 	}
 
 	if ok = C.FliSdk_setCamera_V2(fliContext, cameraName); !ok {
-		return nil, fmt.Errorf("Unable to set camera: %s", cameraStrings[0])
+		return nil, fmt.Errorf("flisdk: Unable to set camera: %s", cameraStrings[0])
 	}
 
 	C.FliSdk_setMode_V2(fliContext, C.Full)
 
 	if ok = C.FliSdk_update_V2(fliContext); !ok {
-		return nil, fmt.Errorf("Unable update SDK")
+		return nil, fmt.Errorf("flisdk: Unable update SDK")
 	}
 
 	// Set sensor cropping
@@ -110,14 +110,19 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	}
 	if ok = C.FliSdk_isCroppingDataValid_V2(fliContext, croppingData); ok {
 		if ok = C.FliSdk_setCroppingState_V2(fliContext, true, croppingData); !ok {
-			return nil, fmt.Errorf("Unable to set cropping state")
+			return nil, fmt.Errorf("flisdk: Unable to set cropping state")
 		}
 	} else {
-		return nil, fmt.Errorf("Cropping data invalid")
+		return nil, fmt.Errorf("flisdk: Cropping data invalid")
 	}
 
+	// Enable the ring buffer to shrink it
 	C.FliSdk_enableRingBuffer_V2(fliContext, true)
 	C.FliSdk_setBufferSizeInImages_V2(fliContext, RingBufferNumImages)
+
+	// Disable the ring buffer
+	C.FliSdk_enableRingBuffer_V2(fliContext, false)
+
 	C.FliSdk_setNbImagesPerBuffer_V2(fliContext, 1)
 
 	// Get image dimensions for buffer size
@@ -152,7 +157,7 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 
 func (f *FLICamera) StartCamera() error {
 	if C.FliSdk_start_V2(f.context) == false {
-		return fmt.Errorf("Unable to start camera")
+		return fmt.Errorf("flisdk: Unable to start camera")
 	}
 
 	return nil
@@ -160,7 +165,7 @@ func (f *FLICamera) StartCamera() error {
 
 func (f *FLICamera) StopCamera() error {
 	if C.FliSdk_stop_V2(f.context) == false {
-		return fmt.Errorf("Unable to stop camera")
+		return fmt.Errorf("flisdk: Unable to stop camera")
 	}
 
 	return nil
@@ -203,8 +208,10 @@ func imageReceived(image unsafe.Pointer, ctx unsafe.Pointer) {
 
 	var ret int64
 	for ok := true; ok; ok = (ret == aeron.BackPressured || ret == aeron.AdminAction) {
-		ret = context.publication.Offer2(context.headerBuffer, 0,
-			context.headerBuffer.Capacity(), context.pixelBuffer, 0,
+		// ret = context.publication.Offer2(context.headerBuffer, 0,
+		// 	context.headerBuffer.Capacity(), context.pixelBuffer, 0,
+		// 	context.pixelBuffer.Capacity(), nil)
+		ret = context.publication.Offer(context.pixelBuffer, 0,
 			context.pixelBuffer.Capacity(), nil)
 		switch ret {
 		case aeron.NotConnected:

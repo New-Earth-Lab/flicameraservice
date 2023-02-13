@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"os"
 	"os/signal"
 	"sync"
@@ -19,7 +18,8 @@ var interrupt = make(chan os.Signal, 1)
 var done = make(chan bool)
 
 const (
-	channel         = "aeron:ipc"
+	// channel         = "aeron:ipc?fc=max"
+	channel         = "aeron:udp?endpoint=localhost:20121|fc=max"
 	driverTimeoutMs = 10000
 	streamID        = 1001
 	loggingOn       = false
@@ -62,7 +62,7 @@ func main() {
 		logger.Fatalf(err.Error())
 	}
 	defer publication.Close()
-	log.Printf("Publication found %v", publication)
+	logger.Infof("Publication found %v", publication)
 
 	go Camera(publication, done)
 
@@ -96,6 +96,7 @@ func Camera(publication *aeron.Publication, done chan bool) {
 	for {
 		select {
 		case <-done:
+			logger.Infof("Shutting down")
 			cam.StopCamera()
 			cam.Shutdown()
 			return
