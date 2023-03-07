@@ -1,4 +1,4 @@
-package flicamera
+package app
 
 /*
 #include <stdint.h>
