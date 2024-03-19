@@ -1,42 +1,50 @@
 package app
 
 /*
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
-
-extern void imageAvailableWrapper(const uint8_t* image, void* ctx);
+extern void imageReceived(void*, void*);
 */
 import "C"
 import (
-	"log"
+	"context"
+	"fmt"
 	"runtime/cgo"
+	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/New-Earth-Lab/flisdk-go/flisdk"
 	"github.com/lirm/aeron-go/aeron"
 	"github.com/lirm/aeron-go/aeron/atomic"
+	"github.com/lirm/aeron-go/aeron/flyweight"
+	"github.com/lirm/aeron-go/aeron/util"
+	"golang.org/x/sync/errgroup"
 )
 
 type FLICamera struct {
-	sdk               *flisdk.FliSdk
-	callbackHandler   flisdk.CallbackHandler
-	width             uint
-	height            uint
-	bytesPerPixel     uint
-	publication       *aeron.Publication
-	pixelBuffer       *atomic.Buffer
-	pixelBufferLength uint
-	headerBuffer      *atomic.Buffer
-	handle            cgo.Handle
+	callbackHandler    flisdk.CallbackHandler
+	sdk                *flisdk.FliSdk
+	publication        *aeron.Publication
+	imageBuffer        *atomic.Buffer
+	headerBuffer       *atomic.Buffer
+	metadataBuffer     *atomic.Buffer
+	handle             cgo.Handle
+	header             ImageHeader
+	headerBufferLength int
 }
 
 const (
 	RingBufferNumImages = 4
 )
 
-func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
+type FliConfig struct {
+	Width        uint32
+	Height       uint32
+	OffsetX      uint16
+	OffsetY      uint16
+	SerialNumber string
+}
+
+func NewFliCamera(config FliConfig, publication *aeron.Publication) (*FLICamera, error) {
 	// Get the configuration for the camera
 	// Grabber name
 	// Camera name
@@ -55,7 +63,7 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	}(&err)
 
 	// Get list of grabbers
-	grabberStrings, err := sdk.DetectGrabbers()
+	_, err = sdk.DetectGrabbers()
 	if err != nil {
 		return nil, err
 	}
@@ -66,16 +74,21 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 		return nil, err
 	}
 
-	// Set the grabber to the configured model if found
-	err = sdk.SetGrabber(grabberStrings[0])
-	if err != nil {
-		return nil, err
+	found := false
+	for _, cam := range cameraStrings {
+		if strings.Contains(cam, config.SerialNumber) {
+			err = sdk.SetCamera(cam)
+			if err != nil {
+				return nil, err
+			}
+			found = true
+			break
+		}
 	}
 
 	// Set the camera to the configured model if found
-	err = sdk.SetCamera(cameraStrings[0])
-	if err != nil {
-		return nil, err
+	if !found {
+		return nil, fmt.Errorf("flicamera: Unable to find camera: %s", config.SerialNumber)
 	}
 
 	err = sdk.SetMode(flisdk.Mode_Full)
@@ -90,10 +103,10 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 
 	// Set sensor cropping
 	croppingData := flisdk.CroppingData{
-		Col1:    0,
-		Col2:    639,
-		Row1:    0,
-		Row2:    511,
+		Col1:    config.OffsetX,
+		Col2:    config.OffsetX + uint16(config.Width) - 1,
+		Row1:    config.OffsetY,
+		Row2:    config.OffsetY + uint16(config.Height) - 1,
 		Enabled: true,
 	}
 
@@ -101,6 +114,9 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Set the pixel format to unsigned
+	sdk.EnableUnsignedPixel(true)
 
 	// Enable the ring buffer to shrink it
 	sdk.EnableRingBuffer(true)
@@ -114,19 +130,29 @@ func NewFliCamera(publication *aeron.Publication) (*FLICamera, error) {
 	width, height := sdk.GetCurrentImageDimension()
 
 	cam := FLICamera{
-		sdk:               sdk,
-		pixelBuffer:       new(atomic.Buffer),
-		pixelBufferLength: sdk.GetImageSizeInBytes(),
-		bytesPerPixel:     sdk.GetBytesPerPixel(),
-		width:             uint(width),
-		height:            uint(height),
-		publication:       publication,
-		headerBuffer:      atomic.MakeBuffer(make([]byte, 256)),
+		sdk:          sdk,
+		imageBuffer:  new(atomic.Buffer),
+		publication:  publication,
+		headerBuffer: atomic.MakeBuffer(make([]byte, 256)), // TODO: this is wasteful
 	}
 
+	// Set static header information
+	cam.header.Wrap(cam.headerBuffer, 0)
+	cam.header.Version.Set(0)
+	cam.header.PayloadType.Set(0)
+	cam.header.Format.Set(0x01100007) // Mono16
+	cam.header.SizeX.Set(int32(width))
+	cam.header.SizeY.Set(int32(height))
+	cam.header.OffsetX.Set(0)
+	cam.header.OffsetY.Set(0)
+	cam.header.PaddingX.Set(0)
+	cam.header.PaddingY.Set(0)
+	cam.header.MetadataLength.Set(0)
+	cam.header.ImageBufferLength.Set(int32(sdk.GetImageSizeInBytes()))
+
 	cam.callbackHandler = sdk.AddCallbackNewImage(
-		(flisdk.NewImageAvailableCallBack)(C.imageAvailableWrapper),
-		0, true, unsafe.Pointer(&cam))
+		(flisdk.NewImageAvailableCallBack)(C.imageReceived),
+		0, true, cam)
 
 	return &cam, nil
 }
@@ -151,53 +177,89 @@ func (f *FLICamera) Shutdown() error {
 	return nil
 }
 
-// type PixelBufferHeader struct {
-// 	flyweight.FWBase
+func (f *FLICamera) Run(ctx context.Context) error {
+	wg, ctx := errgroup.WithContext(ctx)
 
-// 	Timestamp    flyweight.Int64Field
-// 	Width        flyweight.Int32Field
-// 	Height       flyweight.Int32Field
-// 	BitsPerPixel flyweight.Int32Field
-// }
+	wg.Go(func() error {
+		<-ctx.Done()
+		return f.Shutdown()
+	})
+	return wg.Wait()
+}
 
-// func (m *PixelBufferHeader) Wrap(buf *atomic.Buffer, offset int) flyweight.Flyweight {
-// 	pos := offset
-// 	pos += m.ClientID.Wrap(buf, pos)
-// 	pos += m.CorrelationID.Wrap(buf, pos)
+type ImageHeader struct {
+	flyweight.FWBase
 
-// 	m.SetSize(pos - offset)
-// 	return m
-// }
+	Version           flyweight.Int32Field
+	PayloadType       flyweight.Int32Field
+	TimestampNs       flyweight.Int64Field
+	Format            flyweight.Int32Field
+	SizeX             flyweight.Int32Field
+	SizeY             flyweight.Int32Field
+	OffsetX           flyweight.Int32Field
+	OffsetY           flyweight.Int32Field
+	PaddingX          flyweight.Int32Field
+	PaddingY          flyweight.Int32Field
+	MetadataLength    flyweight.Int32Field
+	MetadataBuffer    flyweight.RawDataField
+	pad0              flyweight.Padding
+	ImageBufferLength flyweight.Int32Field
+}
+
+func (m *ImageHeader) Wrap(buf *atomic.Buffer, offset int) flyweight.Flyweight {
+	pos := offset
+	pos += m.Version.Wrap(buf, pos)
+	pos += m.PayloadType.Wrap(buf, pos)
+	pos += m.TimestampNs.Wrap(buf, pos)
+	pos += m.Format.Wrap(buf, pos)
+	pos += m.SizeX.Wrap(buf, pos)
+	pos += m.SizeY.Wrap(buf, pos)
+	pos += m.OffsetX.Wrap(buf, pos)
+	pos += m.OffsetY.Wrap(buf, pos)
+	pos += m.PaddingX.Wrap(buf, pos)
+	pos += m.PaddingY.Wrap(buf, pos)
+	pos += m.MetadataLength.Wrap(buf, pos)
+	pos += m.MetadataBuffer.Wrap(buf, pos, 0)
+	pos = int(util.AlignInt32(int32(pos), 4))
+	pos += m.ImageBufferLength.Wrap(buf, pos)
+	m.SetSize(pos - offset)
+	return m
+}
 
 //export imageReceived
 //go:nocheckptr go:nosplit
 func imageReceived(image unsafe.Pointer, ctx unsafe.Pointer) {
-	cam := (*FLICamera)((*(*cgo.Handle)(ctx)).Value().(unsafe.Pointer))
+	cam := (cgo.Handle)(ctx).Value().(FLICamera)
 
-	// context.headerBuffer.Wrap()
+	start := time.Now()
 
-	// Wrap pixels
-	cam.pixelBuffer.Wrap(image, int32(cam.pixelBufferLength))
+	// Get image dimensions for buffer size
+	// width, height, bytes := cam.sdk.GetImageSize()
+	// crop, _ := cam.sdk.GetCroppingState()
 
-	var ret int64
-	for ok := true; ok; ok = (ret == aeron.BackPressured || ret == aeron.AdminAction) {
-		// ret = context.publication.Offer2(context.headerBuffer, 0,
-		// 	context.headerBuffer.Capacity(), context.pixelBuffer, 0,
-		// 	context.pixelBuffer.Capacity(), nil)
-		ret = cam.publication.Offer(cam.pixelBuffer, 0, cam.pixelBuffer.Capacity(), nil)
+	// Set
+	cam.header.TimestampNs.Set(start.UnixNano())
+	// cam.header.SizeX.Set(int32(width))
+	// cam.header.SizeY.Set(int32(height))
+	// cam.header.OffsetX.Set(int32(crop.Col1))
+	// cam.header.OffsetY.Set(int32(crop.Row1))
+	// cam.header.ImageBufferLength.Set(int32(bytes))
+
+	cam.imageBuffer.Wrap(image, cam.header.ImageBufferLength.Get())
+
+	const timeout = 100 * time.Microsecond
+
+	for time.Since(start) < timeout {
+		ret := cam.publication.Offer2(cam.headerBuffer, 0,
+			int32(cam.header.Size()), cam.imageBuffer, 0,
+			cam.imageBuffer.Capacity(), nil)
 		switch ret {
-		case aeron.NotConnected:
-			// log.Printf("not connected yet")
-		case aeron.BackPressured:
-			// log.Printf("back pressured")
-		case aeron.AdminAction:
-			// log.Printf("admin action")
-		case aeron.PublicationClosed:
-			log.Printf("publication closed")
+		// Retry on AdminAction and BackPressured
+		case aeron.AdminAction, aeron.BackPressured:
+			continue
+		// Otherwise return as completed
 		default:
-			if ret < 0 {
-				log.Printf("Unrecognized code: %d", ret)
-			}
+			return
 		}
 	}
 }
